@@ -1,94 +1,85 @@
 #!/usr/bin/env python3
-"""Main entry point for py-tiny-claw engine with mock components."""
+"""Main entry point for py-tiny-claw engine with real DashScope provider."""
 
 import logging
 import os
 
 from internal.engine import AgentEngine
-from internal.provider import LLMProvider
-from internal.schema import Message, Role, ToolCall, ToolDefinition, ToolResult
+from internal.provider import OpenAIProvider, ProviderError
+from internal.schema import ToolCall, ToolDefinition, ToolResult
 from internal.tools import Registry
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 
 # ==========================================
-# 1. Mock LLM Provider
-# ==========================================
-class MockProvider:
-    """Mock LLM provider that simulates model responses."""
-
-    def __init__(self) -> None:
-        self.turn = 0
-
-    def generate(
-        self,
-        messages: list[Message],
-        available_tools: list[ToolDefinition],
-    ) -> Message:
-        """Simulate LLM response: first turn requests bash, second turn outputs final result."""
-        self.turn += 1
-
-        if self.turn == 1:
-            return Message(
-                role=Role.ASSISTANT,
-                content="让我来看看当前目录下有什么文件。",
-                tool_calls=[
-                    ToolCall(
-                        id="call_123",
-                        name="bash",
-                        arguments={"command": "ls -la"},
-                    ),
-                ],
-            )
-
-        return Message(
-            role=Role.ASSISTANT,
-            content="我看到了文件列表，里面包含 main.py，任务完成！",
-        )
-
-
-# ==========================================
-# 2. Mock Tool Registry
+# Mock Tool Registry (for testing Provider tool extraction)
 # ==========================================
 class MockRegistry:
-    """Mock tool registry that returns fake terminal output."""
+    """Mock tool registry with get_weather tool."""
 
     def get_available_tools(self) -> list[ToolDefinition]:
-        """Return empty tool definitions for mock."""
-        return []
+        """Return tool definitions."""
+        return [
+            ToolDefinition(
+                name="get_weather",
+                description="获取指定城市的当前天气情况。",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                    },
+                    "required": ["city"],
+                },
+            ),
+        ]
 
     def execute(self, call: ToolCall) -> ToolResult:
-        """Return fake terminal output."""
+        """Execute mock tool and return fake weather result."""
+        logging.info(f"  -> [Mock 工具执行] 获取 {call.arguments.get('city', '未知')} 的天气中...")
         return ToolResult(
             tool_call_id=call.id,
-            output="-rw-r--r--  1 user group  234 Oct 24 10:00 main.py\n",
+            output="API 返回：今天是晴天，气温 25 度。",
             is_error=False,
         )
 
 
 # ==========================================
-# 3. Assemble and Run
+# Main Entry Point
 # ==========================================
 def main() -> None:
     """Main entry point."""
     logging.info("🚀 欢迎来到 py-tiny-claw 引擎启动序列")
 
-    # Get current directory as WorkDir physical boundary
+    # Ensure DASHSCOPE_API_KEY is set
+    if not os.getenv("DASHSCOPE_API_KEY"):
+        logging.error("请先设置 DASHSCOPE_API_KEY 环境变量")
+        return
+
     work_dir = os.getcwd()
 
-    p = MockProvider()
-    r = MockRegistry()
+    # 1. Initialize real Provider (DashScope with glm-5)
+    try:
+        llm_provider = OpenAIProvider.new_dashscope_provider("glm-5")
+        logging.info(f"Provider initialized: {llm_provider.model}")
+    except ProviderError as e:
+        logging.error(f"Provider 初始化失败: {e}")
+        return
 
-    # Instantiate core engine
-    eng = AgentEngine(p, r, work_dir)
+    # 2. Inject mock tool registry
+    registry = MockRegistry()
 
-    # Execute task
+    # 3. Instantiate and run engine with thinking mode enabled
+    eng = AgentEngine(llm_provider, registry, work_dir, enable_thinking=False)
+
+    # Test prompt
+    prompt = "我想去北京跑步，帮我查查天气适合吗？"
+
     logging.info("开始执行任务...")
     try:
-        eng.run("帮我检查当前目录的文件")
+        eng.run(prompt)
     except RuntimeError as e:
-        logging.error(f"引擎崩溃: {e}")
+        logging.error(f"引擎运行崩溃: {e}")
         raise
 
 
