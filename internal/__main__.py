@@ -42,12 +42,23 @@ def main() -> None:
     # 5. Instantiate engine with thinking disabled (YOLO fast mode)
     eng = AgentEngine(llm_provider, registry, work_dir, enable_thinking=False)
 
-    # 6. Execute a task requiring sequential physical actions
+    # 6. Create test files for parallel read test
+    test_files = {
+        "a.txt": "人工智能（AI）是计算机科学的一个分支，致力于创建能够模拟人类智能的系统。\n主要研究领域包括机器学习、自然语言处理、计算机视觉等。\n深度学习是近年来最热门的技术方向。",
+        "b.txt": "量子力学是现代物理学的基础理论，描述了微观粒子的运动规律。\n薛定谔方程是量子力学的核心方程。\n量子计算是量子力学在计算机科学中的应用。",
+        "c.txt": "生物学是研究生命现象和生命活动规律的科学。\n分子生物学研究生命现象的分子基础。\n基因工程是现代生物技术的重要组成部分。",
+    }
+
+    for filename, content in test_files.items():
+        filepath = os.path.join(work_dir, filename)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    # 7. Execute a task requiring multi-source information collection (parallel test)
     prompt = """
-    请帮我执行以下操作：
-    1. 用 bash 查看一下我当前电脑的 Python 版本。
-    2. 帮我写一个简单的 helloworld.py 文件，输出 "Hello, py-tiny-claw!"。
-    3. 用 bash 运行这个 Python 文件，确认它能正常工作。
+    我当前目录下有 a.txt, b.txt, c.txt 三个文件。
+    为了节省时间，请你同时一次性读取这三个文件，并将它们的内容综合起来，
+    告诉我它们分别记录了什么领域的信息。
     """
 
     logging.info("开始执行任务...")
@@ -56,6 +67,12 @@ def main() -> None:
     except RuntimeError as e:
         logging.error(f"引擎运行崩溃: {e}")
         raise
+    finally:
+        # Cleanup test files
+        for filename in test_files.keys():
+            filepath = os.path.join(work_dir, filename)
+            if os.path.exists(filepath):
+                os.remove(filepath)
 
 
 if __name__ == "__main__":

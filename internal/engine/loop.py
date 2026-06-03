@@ -1,12 +1,41 @@
 """Agent engine core loop implementation."""
 
+import json
 import logging
+import threading
 
+from internal.engine.reporter import Reporter
 from internal.provider import LLMProvider
 from internal.schema import Message, Role, ToolCall
 from internal.tools import Registry
 
 logger = logging.getLogger(__name__)
+
+
+class WaitGroup:
+    """Python implementation of Go's sync.WaitGroup."""
+
+    def __init__(self) -> None:
+        self._count = 0
+        self._condition = threading.Condition()
+
+    def add(self, delta: int = 1) -> None:
+        """Add delta to the counter."""
+        with self._condition:
+            self._count += delta
+
+    def done(self) -> None:
+        """Decrement counter by one."""
+        with self._condition:
+            self._count -= 1
+            if self._count == 0:
+                self._condition.notify_all()
+
+    def wait(self) -> None:
+        """Block until counter reaches zero."""
+        with self._condition:
+            while self._count > 0:
+                self._condition.wait()
 
 
 class AgentEngine:
@@ -32,11 +61,12 @@ class AgentEngine:
         self.work_dir = work_dir
         self.enable_thinking = enable_thinking
 
-    def run(self, user_prompt: str) -> None:
+    def run(self, user_prompt: str, reporter: Reporter | None = None) -> None:
         """Start the agent lifecycle with ReAct loop.
 
         Args:
             user_prompt: Initial user request to process.
+            reporter: Reporter for output notifications (optional).
 
         Raises:
             RuntimeError: If LLM generation fails.
@@ -69,14 +99,15 @@ class AgentEngine:
             if self.enable_thinking:
                 logger.info("[Engine][Phase 1] 剥夺工具访问权，强制进入慢思考与规划阶段...")
 
-                # 核心机制：传入的 available_tools 为 None！
-                # 大模型看不到任何 JSON Schema，被迫只能输出纯文本的思考过程。
+                # 【触发 Reporter】: 开始慢思考
+                if reporter:
+                    reporter.on_thinking()
+
                 try:
                     think_resp = self.provider.generate(context_history, None)
                 except Exception as e:
                     raise RuntimeError(f"Thinking 阶段生成失败: {e}") from e
 
-                # 如果模型输出了思考过程，将其作为 Assistant 消息追加到上下文中
                 if think_resp.content:
                     print(f"🧠 [内部思考 Trace]: {think_resp.content}")
                     context_history.append(think_resp)
@@ -86,8 +117,6 @@ class AgentEngine:
             # ====================================================================
             logger.info("[Engine][Phase 2] 恢复工具挂载，等待模型采取行动...")
 
-            # 此时的 context_history 中已经包含了上一阶段模型自己的 Thinking Trace。
-            # 模型会顺着自己的逻辑，结合恢复的 available_tools 发起精准的工具调用。
             try:
                 action_resp = self.provider.generate(context_history, available_tools)
             except Exception as e:
@@ -95,31 +124,88 @@ class AgentEngine:
 
             context_history.append(action_resp)
 
-            if action_resp.content:
+            # 【触发 Reporter】: 输出阶段性总结或最终回复
+            if action_resp.content and reporter:
+                reporter.on_message(action_resp.content)
+            elif action_resp.content:
                 print(f"🤖 [对外回复]: {action_resp.content}")
 
             # ====================================================================
-            # 退出与执行逻辑
+            # 退出判断
             # ====================================================================
             if not action_resp.tool_calls:
                 logger.info("[Engine] 模型未请求调用工具，任务宣告完成。")
                 break
 
-            logger.info(f"[Engine] 模型请求调用 {len(action_resp.tool_calls)} 个工具...")
+            logger.info(f"[Engine] 模型请求并发调用 {len(action_resp.tool_calls)} 个工具...")
 
-            for tool_call in action_resp.tool_calls:
-                logger.info(f"  -> 🛠️ 执行工具: {tool_call.name}, 参数: {tool_call.arguments}")
+            # ====================================================================
+            # 【核心改造】: 从串行演进为并行
+            # ====================================================================
 
-                result = self.registry.execute(tool_call)
+            # 1. 预分配固定长度列表，安全存放各并发工具的执行结果
+            # 长度与 ToolCalls 数量完全一致
+            observation_msgs: list[Message | None] = [None] * len(action_resp.tool_calls)
 
-                if result.is_error:
-                    logger.info(f"  -> ❌ 工具执行报错: {result.output}")
-                else:
-                    logger.info(f"  -> ✅ 工具执行成功 (返回 {len(result.output)} 字节)")
+            # 2. 声明 WaitGroup 用于阻塞等待所有线程完成
+            wg = WaitGroup()
 
-                observation_msg = Message(
-                    role=Role.USER,
-                    content=result.output,
-                    tool_call_id=tool_call.id,
-                )
-                context_history.append(observation_msg)
+            # 3. 遍历所有工具，为每个工具 Fork 出独立线程
+            for i, tool_call in enumerate(action_resp.tool_calls):
+                wg.add(1)  # 增加计数器
+
+                # 开启线程。注意：必须将 idx 和 call 作为参数传入，
+                # 防止闭包变量捕获陷阱！
+                def worker(idx: int, call: ToolCall) -> None:
+                    try:
+                        args_str = json.dumps(call.arguments)
+
+                        # 【触发 Reporter】: 报告即将执行的工具
+                        if reporter:
+                            reporter.on_tool_call(call.name, args_str)
+
+                        logger.info(f"  -> [Thread-{idx}] 🛠️ 触发并行执行: {call.name}")
+
+                        # 调用底层 Registry 执行工具（物理操作）
+                        result = self.registry.execute(call)
+
+                        if result.is_error:
+                            logger.info(f"  -> [Thread-{idx}] ❌ 工具执行报错: {result.output[:100]}...")
+                        else:
+                            logger.info(f"  -> [Thread-{idx}] ✅ 工具执行成功 (返回 {len(result.output)} 字节)")
+
+                        # Truncate display output for Reporter
+                        display_output = result.output
+                        if len(display_output) > 200:
+                            display_output = display_output[:200] + "... (已截断)"
+
+                        # 【触发 Reporter】: 汇报工具执行结果
+                        if reporter:
+                            reporter.on_tool_result(call.name, display_output, result.is_error)
+
+                        # 将执行结果封装为用户消息
+                        obs_msg = Message(
+                            role=Role.USER,
+                            content=result.output,
+                            tool_call_id=call.id,
+                        )
+
+                        # 【线程安全】: 每个线程操作预分配列表的不同索引
+                        # 不需要加锁，性能极高！
+                        observation_msgs[idx] = obs_msg
+
+                    finally:
+                        wg.done()  # 线程结束时计数器减一
+
+                # 启动线程，传入参数避免闭包陷阱
+                thread = threading.Thread(target=worker, args=(i, tool_call))
+                thread.start()
+
+            # 4. Join 阻塞等待：主循环挂起，直到所有并发线程完成
+            wg.wait()
+            logger.info("[Engine] 所有并发工具执行完毕，开始聚合观察结果 (Observation)...")
+
+            # 5. 聚合装填：将并行结果按原本顺序追加到上下文时间线
+            for obs in observation_msgs:
+                if obs is not None:
+                    context_history.append(obs)
