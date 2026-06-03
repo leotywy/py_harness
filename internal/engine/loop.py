@@ -4,6 +4,7 @@ import json
 import logging
 import threading
 
+from internal.context import PromptComposer
 from internal.engine.reporter import Reporter
 from internal.provider import LLMProvider
 from internal.schema import Message, Role, ToolCall
@@ -60,6 +61,8 @@ class AgentEngine:
         self.registry = registry
         self.work_dir = work_dir
         self.enable_thinking = enable_thinking
+        # 【新增】引擎持有 Composer 实例
+        self.composer = PromptComposer(work_dir)
 
     def run(self, user_prompt: str, reporter: Reporter | None = None) -> None:
         """Start the agent lifecycle with ReAct loop.
@@ -74,15 +77,14 @@ class AgentEngine:
         logger.info(f"[Engine] 引擎启动，锁定工作区: {self.work_dir}")
         logger.info(f"[Engine] 慢思考模式 (Thinking Phase): {self.enable_thinking}")
 
+        # 【核心修改】动态组装 System Prompt
+        # 彻底替换掉以前硬编码的提示词！
+        system_msg = self.composer.build()
+
+        # 注入动态组装的内核、AGENTS.md 与 Skills
         context_history: list[Message] = [
-            Message(
-                role=Role.SYSTEM,
-                content="You are py-tiny-claw, an expert coding assistant. You have full access to tools in the workspace.",
-            ),
-            Message(
-                role=Role.USER,
-                content=user_prompt,
-            ),
+            system_msg,
+            Message(role=Role.USER, content=user_prompt),
         ]
 
         turn_count = 0
@@ -144,7 +146,6 @@ class AgentEngine:
             # ====================================================================
 
             # 1. 预分配固定长度列表，安全存放各并发工具的执行结果
-            # 长度与 ToolCalls 数量完全一致
             observation_msgs: list[Message | None] = [None] * len(action_resp.tool_calls)
 
             # 2. 声明 WaitGroup 用于阻塞等待所有线程完成
@@ -152,10 +153,8 @@ class AgentEngine:
 
             # 3. 遍历所有工具，为每个工具 Fork 出独立线程
             for i, tool_call in enumerate(action_resp.tool_calls):
-                wg.add(1)  # 增加计数器
+                wg.add(1)
 
-                # 开启线程。注意：必须将 idx 和 call 作为参数传入，
-                # 防止闭包变量捕获陷阱！
                 def worker(idx: int, call: ToolCall) -> None:
                     try:
                         args_str = json.dumps(call.arguments)
@@ -166,7 +165,7 @@ class AgentEngine:
 
                         logger.info(f"  -> [Thread-{idx}] 🛠️ 触发并行执行: {call.name}")
 
-                        # 调用底层 Registry 执行工具（物理操作）
+                        # 调用底层 Registry 执行工具
                         result = self.registry.execute(call)
 
                         if result.is_error:
@@ -191,21 +190,20 @@ class AgentEngine:
                         )
 
                         # 【线程安全】: 每个线程操作预分配列表的不同索引
-                        # 不需要加锁，性能极高！
                         observation_msgs[idx] = obs_msg
 
                     finally:
-                        wg.done()  # 线程结束时计数器减一
+                        wg.done()
 
                 # 启动线程，传入参数避免闭包陷阱
                 thread = threading.Thread(target=worker, args=(i, tool_call))
                 thread.start()
 
-            # 4. Join 阻塞等待：主循环挂起，直到所有并发线程完成
+            # 4. Join 阻塞等待
             wg.wait()
             logger.info("[Engine] 所有并发工具执行完毕，开始聚合观察结果 (Observation)...")
 
-            # 5. 聚合装填：将并行结果按原本顺序追加到上下文时间线
+            # 5. 聚合装填：将并行结果追加到上下文时间线
             for obs in observation_msgs:
                 if obs is not None:
                     context_history.append(obs)
