@@ -5,6 +5,7 @@ from .bash import BashTool
 from .edit_file import EditFileTool
 from .read_file import ReadFileTool
 from .write_file import WriteFileTool
+from .subagent import AgentRunner, SubagentTool
 
 __all__ = [
     "Tool",
@@ -17,4 +18,6 @@ __all__ = [
     "EditFileTool",
     "ReadFileTool",
     "WriteFileTool",
+    "AgentRunner",
+    "SubagentTool",
 ]

@@ -1,12 +1,29 @@
 """Tool registry for registration and execution dispatch."""
 
+import json
 import logging
 from abc import ABC, abstractmethod
 from typing import Protocol, runtime_checkable
 
+from internal.observability import start_span
 from internal.schema import ToolCall, ToolDefinition, ToolResult
 
 logger = logging.getLogger(__name__)
+
+
+def _truncate(s: str, max_len: int = 100) -> str:
+    """Truncate string to prevent trace file bloat.
+
+    Args:
+        s: String to truncate.
+        max_len: Maximum length (default 100).
+
+    Returns:
+        Truncated string with "..." suffix if needed.
+    """
+    if len(s) > max_len:
+        return s[:max_len] + "..."
+    return s
 
 
 # ==========================================
@@ -83,8 +100,16 @@ class Registry(Protocol):
         """Return all registered tools' schema definitions for the Main Loop."""
         ...
 
-    def execute(self, call: ToolCall) -> ToolResult:
-        """Execute the requested tool and return the result."""
+    def execute(self, call: ToolCall, ctx: dict | None = None) -> ToolResult:
+        """Execute the requested tool and return the result.
+
+        Args:
+            call: Tool call request from the LLM.
+            ctx: Context for tracing (optional).
+
+        Returns:
+            Tool execution result.
+        """
         ...
 
 
@@ -102,8 +127,16 @@ class BaseRegistry(ABC):
         pass
 
     @abstractmethod
-    def execute(self, call: ToolCall) -> ToolResult:
-        """Execute the requested tool and return the result."""
+    def execute(self, call: ToolCall, ctx: dict | None = None) -> ToolResult:
+        """Execute the requested tool and return the result.
+
+        Args:
+            call: Tool call request from the LLM.
+            ctx: Context for tracing (optional).
+
+        Returns:
+            Tool execution result.
+        """
         pass
 
 
@@ -146,45 +179,63 @@ class ToolRegistry(BaseRegistry):
         """Return all registered tools' schema definitions."""
         return [tool.definition() for tool in self._tools.values()]
 
-    def execute(self, call: ToolCall) -> ToolResult:
+    def execute(self, call: ToolCall, ctx: dict | None = None) -> ToolResult:
         """Execute the requested tool and return the result.
 
         Args:
             call: Tool call request from the LLM.
+            ctx: Context for tracing (optional).
 
         Returns:
             Tool execution result.
         """
-        # 1. Route lookup: if tool not found, model hallucinated
-        tool = self._tools.get(call.name)
-        if tool is None:
-            err_msg = f"Error: 系统中不存在名为 '{call.name}' 的工具。"
-            logger.error(err_msg)
-            return ToolResult(
-                tool_call_id=call.id,
-                output=err_msg,
-                is_error=True,  # Mark as error, model will attempt correction
-            )
+        # 【埋点 5】：开启工具执行的 Span
+        if ctx is None:
+            ctx = {}
+        ctx, span = start_span(ctx, f"Tool.{call.name}")
+        span.add_attribute("tool_name", call.name)
+        # 将 JSON 参数存入以备调试
+        span.add_attribute("arguments", json.dumps(call.arguments))
 
-        # 2. Execute tool logic
         try:
-            output = tool.execute(call.arguments)
-            logger.info(f"[Registry] 工具 '{call.name}' 执行成功")
-            return ToolResult(
-                tool_call_id=call.id,
-                output=output,
-                is_error=False,
-            )
+            # 1. Route lookup: if tool not found, model hallucinated
+            tool = self._tools.get(call.name)
+            if tool is None:
+                err_msg = f"Error: 系统中不存在名为 '{call.name}' 的工具。"
+                logger.error(err_msg)
+                span.add_attribute("error", err_msg)
+                return ToolResult(
+                    tool_call_id=call.id,
+                    output=err_msg,
+                    is_error=True,  # Mark as error, model will attempt correction
+                )
 
-        # 3. Handle execution error
-        except Exception as e:
-            err_msg = f"Error executing {call.name}: {e}"
-            logger.error(err_msg)
-            return ToolResult(
-                tool_call_id=call.id,
-                output=err_msg,
-                is_error=True,
-            )
+            # 2. Execute tool logic
+            try:
+                output = tool.execute(call.arguments)
+                logger.info(f"[Registry] 工具 '{call.name}' 执行成功")
+                # 截取输出的前 100 字符放入 Trace，防止 Trace 文件过度膨胀
+                span.add_attribute("output_preview", _truncate(output, 100))
+                return ToolResult(
+                    tool_call_id=call.id,
+                    output=output,
+                    is_error=False,
+                )
+
+            # 3. Handle execution error
+            except Exception as e:
+                err_msg = f"Error executing {call.name}: {e}"
+                logger.error(err_msg)
+                span.add_attribute("error", err_msg)
+                return ToolResult(
+                    tool_call_id=call.id,
+                    output=err_msg,
+                    is_error=True,
+                )
+
+        finally:
+            # 无论成功失败，确保结束 Span
+            span.end_span()
 
 
 # ==========================================

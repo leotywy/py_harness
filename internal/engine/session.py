@@ -22,6 +22,11 @@ class Session:
     history: list[Message] = field(default_factory=list)
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
+    # 【新增】用于统计该 Session 累计消耗的资源
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_cost_cny: float = 0.0
+
     def append(self, *msgs: Message) -> None:
         """Thread-safe append messages to session history.
 
@@ -34,6 +39,21 @@ class Session:
 
             # 【持久化预留点】In production, we would save history to disk:
             # work_dir/.claw/sessions/{id}.jsonl
+
+    def record_usage(self, prompt_tokens: int, completion_tokens: int, cost: float) -> None:
+        """Record usage for billing accumulation.
+
+        给外部 Tracker 调用的辅助方法，用于累加账单。
+
+        Args:
+            prompt_tokens: Number of input tokens consumed.
+            completion_tokens: Number of output tokens generated.
+            cost: Cost in CNY for this API call.
+        """
+        with self._lock:
+            self.total_prompt_tokens += prompt_tokens
+            self.total_completion_tokens += completion_tokens
+            self.total_cost_cny += cost
 
     def get_working_memory(self, limit: int = 0) -> list[Message]:
         """Get recent messages as working memory.

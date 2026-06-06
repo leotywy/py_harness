@@ -6,7 +6,7 @@ import os
 from openai import OpenAI
 
 from internal.provider.interface import BaseProvider, ProviderError
-from internal.schema import Message, Role, ToolCall, ToolDefinition
+from internal.schema import Message, Role, ToolCall, ToolDefinition, Usage
 
 
 class OpenAIProvider(BaseProvider):
@@ -174,6 +174,13 @@ class OpenAIProvider(BaseProvider):
             role=Role.ASSISTANT,
             content=choice.content or "",
         )
+
+        # 【新增】提取 Usage 信息
+        if response.usage and (response.usage.prompt_tokens > 0 or response.usage.completion_tokens > 0):
+            result_msg.usage = Usage(
+                prompt_tokens=response.usage.prompt_tokens,
+                completion_tokens=response.usage.completion_tokens,
+            )
 
         if choice.tool_calls:
             for tc in choice.tool_calls:

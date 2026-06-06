@@ -14,6 +14,14 @@ class Role(str, Enum):
 
 
 @dataclass
+class Usage:
+    """Records token consumption for a single LLM API call."""
+
+    prompt_tokens: int = 0       # Number of input tokens
+    completion_tokens: int = 0   # Number of generated tokens
+
+
+@dataclass
 class ToolCall:
     """Represents a model request to call a specific tool."""
 
@@ -40,6 +48,9 @@ class Message:
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_call_id: str = ""
 
+    # 【新增】如果这是大模型 (Assistant) 的回复，此字段存放本次调用的 Token 消耗
+    usage: Usage | None = None
+
     def to_dict(self) -> dict[str, Any]:
         """Convert message to dictionary for JSON serialization."""
         result: dict[str, Any] = {"role": self.role.value}
@@ -55,6 +66,12 @@ class Message:
 
         if self.tool_call_id:
             result["tool_call_id"] = self.tool_call_id
+
+        if self.usage:
+            result["usage"] = {
+                "prompt_tokens": self.usage.prompt_tokens,
+                "completion_tokens": self.usage.completion_tokens,
+            }
 
         return result
 
